@@ -8,6 +8,7 @@ import util from "util";
 import fs from "fs/promises";
 import path from "path";
 import dotenv from "dotenv";
+import os from "os";
 
 // Load environment variables
 dotenv.config();
@@ -20,58 +21,41 @@ const execAsync = util.promisify(exec);
 
 const PORT = process.env.PORT || 3000;
 
-// Map repository keys (used by LLM) to local filesystem paths (from .env)
-const REPO_MAP: Record<string, string | undefined> = {
-  "revm": process.env.PATH_REVM || "https://github.com/Altius-Labs/altius-revm",
-  "alloy": process.env.PATH_ALLOY || "https://github.com/Altius-Labs/altius-alloy-evm",
-  "reth": process.env.PATH_RETH || "https://github.com/Altius-Labs/altius-reth",
+const REPO_URLS: Record<string, string | undefined> = {
+  "revm": process.env.URL_REVM,
+  "alloy": process.env.URL_ALLOY,
+  "reth": process.env.URL_RETH
 };
+
+const CACHE_DIR = path.join(process.cwd(), "repos");
+const LOCAL_PATHS: Record<string, string> = {};
 
 // =============================================================================
 // REPO MANAGEMENT
 // =============================================================================
 
-/**
- * Validates and updates a single repository.
- */
-async function syncRepo(name: string, repoPath: string) {
-  console.log(`[Repo: ${name}] Checking path: ${repoPath}`);
+async function ensureRepo(name: string, remoteUrl: string) {
+  const localPath = path.join(CACHE_DIR, name);
+  LOCAL_PATHS[name] = localPath;
+
+  console.log(`[Repo: ${name}] Preparing...`);
 
   try {
-    // 1. Check existence
-    await fs.access(repoPath);
-
-    // 2. Check if it's a git repo
-    const gitCheck = await execAsync("git rev-parse --is-inside-work-tree", { cwd: repoPath });
-    if (!gitCheck.stdout.trim()) {
-      throw new Error("Path exists but is not a git repository");
-    }
-
-    // 3. Attempt git pull
-    console.log(`[Repo: ${name}] Pulling latest changes...`);
     try {
-      const { stdout } = await execAsync("git pull", { cwd: repoPath });
-      console.log(`[Repo: ${name}] Update success: ${stdout.trim().split('\n')[0]}`);
-    } catch (pullError) {
-      console.warn(`[Repo: ${name}] 'git pull' failed (offline or dirty tree). Serving current version.`);
+      await fs.access(path.join(localPath, ".git"));
+      console.log(`[Repo: ${name}] Local cache found at ${localPath}`);
+      // Optional: Pull latest changes
+      // console.log(`[Repo: ${name}] Pulling latest changes...`);
+      // await execAsync("git pull", { cwd: localPath });
+    } catch (e) {
+      console.log(`[Repo: ${name}] Cache missing. Cloning from remote...`);
+      await fs.mkdir(CACHE_DIR, { recursive: true });
+      await execAsync(`git clone ${remoteUrl} ${name}`, { cwd: CACHE_DIR });
+      console.log(`[Repo: ${name}] Clone success!`);
     }
-
   } catch (error) {
-    console.error(`[Repo: ${name}] Critical Error: Path invalid or inaccessible.`);
-    process.exit(1);
+    console.error(`[Repo: ${name}] Critical Error during setup:`, error);
   }
-}
-
-/**
- * Helper to get repo path or throw error if invalid
- */
-function getRepoPath(repoName: string): string {
-  const targetPath = REPO_MAP[repoName];
-  if (!targetPath) {
-    const available = Object.keys(REPO_MAP).join(", ");
-    throw new Error(`Unknown repository: '${repoName}'. Available: ${available}`);
-  }
-  return targetPath;
 }
 
 // =============================================================================
@@ -79,115 +63,97 @@ function getRepoPath(repoName: string): string {
 // =============================================================================
 
 const server = new McpServer({
-  name: "altius-multi-repo-mcp",
+  name: "altius-cloud-mcp",
   version: "1.0.0",
 });
 
-// Tool 1: List Repositories
-server.registerTool(
-  "list_repos",
-  {
-    description: "List all configured repositories available for access.",
-    inputSchema: {}
-  },
+function getPath(repoName: string) {
+  const p = LOCAL_PATHS[repoName];
+  if (!p) throw new Error(`Repository ${repoName} is not available.`);
+  return p;
+}
+
+// Change 1: utilize server.tool instead of server.registerTool
+// Tool: List Repos
+server.tool(
+  "list_repos", 
+  {}, // No input arguments
   async () => {
-    const list = Object.entries(REPO_MAP)
-      .map(([k, v]) => `- **${k}**: \`${v}\``)
-      .join("\n");
-    return { content: [{ type: "text", text: list }] };
+    const list = Object.keys(LOCAL_PATHS).map(k => `- ${k}`).join("\n");
+    return { content: [{ type: "text", text: `Active Repositories:\n${list}` }] };
   }
 );
 
-// Tool 2: Search Code (Multi-repo + Branch support)
-server.registerTool(
+// Tool: Search Code
+server.tool(
   "search_code",
   {
-    description: "Search for code patterns using git grep in a specific repo.",
-    inputSchema: {
-      repo: z.enum(["revm", "alloy", "reth"]).describe("The target repository name"),
-      query: z.string().describe("The search string or regex"),
-      branch: z.string().optional().describe("Branch name or commit hash (default: HEAD)"),
-      path_filter: z.string().optional().describe("Limit search to specific subdirectory")
-    }
+    repo: z.enum(["revm", "alloy", "reth"]),
+    query: z.string(),
+    branch: z.string().optional(),
+    path_filter: z.string().optional()
   },
+  // The 'args' object is now correctly typed thanks to Zod inference
   async ({ repo, query, branch, path_filter }) => {
-    const repoPath = getRepoPath(repo);
-    const targetRef = branch || "HEAD";
+    const cwd = getPath(repo);
+    const ref = branch || "HEAD";
     const filter = path_filter || ".";
-
-    // git grep -n (line number) -I (no binary)
-    const cmd = `git grep -nI "${query}" ${targetRef} -- ${filter} | head -n 50`;
-
+    
+    // Safety check for command injection is recommended here in production
+    // Using simple git grep
+    const cmd = `git grep -nI "${query}" ${ref} -- ${filter} | head -n 50`;
     try {
-      const { stdout } = await execAsync(cmd, { cwd: repoPath });
-      return {
-        content: [{ type: "text", text: stdout || "No matches found." }]
-      };
+      const { stdout } = await execAsync(cmd, { cwd });
+      return { content: [{ type: "text", text: stdout || "No matches." }] };
     } catch (e) {
-      return {
-        content: [{ type: "text", text: "No matches found." }]
-      };
+      return { content: [{ type: "text", text: "No matches found." }] };
     }
   }
 );
 
-// Tool 3: Read File (Multi-repo + Branch support)
-server.registerTool(
+// Tool: Read File
+server.tool(
   "read_file",
   {
-    description: "Read a file from a specific repo and branch.",
-    inputSchema: {
-      repo: z.enum(["revm", "alloy", "reth"]).describe("The target repository name"),
-      path: z.string().describe("Relative path to the file"),
-      branch: z.string().optional().describe("Branch name or commit hash (default: HEAD)")
-    }
+    repo: z.enum(["revm", "alloy", "reth"]),
+    path: z.string(),
+    branch: z.string().optional()
   },
   async ({ repo, path: filePath, branch }) => {
-    const repoPath = getRepoPath(repo);
-    const targetRef = branch || "HEAD";
-
+    const cwd = getPath(repo);
+    const ref = branch || "HEAD";
+    
+    // Basic path traversal prevention
     if (filePath.includes("..")) {
-      return { content: [{ type: "text", text: "Invalid path." }], isError: true };
+      return { content: [{ type: "text", text: "Invalid path" }], isError: true };
     }
 
-    // git show <ref>:<path>
-    const cmd = `git show ${targetRef}:${filePath}`;
-
+    const cmd = `git show ${ref}:${filePath}`;
     try {
-      const { stdout } = await execAsync(cmd, { cwd: repoPath });
-      return {
-        content: [{ type: "text", text: stdout }]
-      };
+      const { stdout } = await execAsync(cmd, { cwd });
+      return { content: [{ type: "text", text: stdout }] };
     } catch (e) {
-      return {
-        content: [{ type: "text", text: `Error: File not found in ${repo} at ${targetRef}` }]
-      };
+      return { content: [{ type: "text", text: "File not found." }] };
     }
   }
 );
 
-// Tool 4: List Branches
-server.registerTool(
+// Tool: List Branches
+server.tool(
   "list_branches",
-  {
-    description: "List branches for a specific repository.",
-    inputSchema: {
-      repo: z.enum(["revm", "alloy", "reth"])
-    }
-  },
+  { repo: z.enum(["revm", "alloy", "reth"]) },
   async ({ repo }) => {
-    const repoPath = getRepoPath(repo);
     try {
-      const { stdout } = await execAsync("git branch -a", { cwd: repoPath });
+      const { stdout } = await execAsync("git branch -a", { cwd: getPath(repo) });
       return { content: [{ type: "text", text: stdout }] };
-    } catch (e) {
-      return { content: [{ type: "text", text: "Error listing branches." }] };
+    } catch (e) { 
+      return { content: [{ type: "text", text: "Error listing branches" }] }; 
     }
   }
 );
 
 // =============================================================================
-// HTTP / SSE SERVER
+// HTTP SERVER
 // =============================================================================
 
 const app = express();
@@ -196,31 +162,26 @@ app.use(cors());
 let transport: SSEServerTransport;
 
 app.get("/sse", async (req, res) => {
-  console.log("-> Client connected via SSE");
+  console.log("-> Client connected");
   transport = new SSEServerTransport("/messages", res);
   await server.connect(transport);
 });
 
 app.post("/messages", async (req, res) => {
-  if (transport) {
-    await transport.handlePostMessage(req, res);
-  } else {
-    res.status(400).send("No active connection");
-  }
+  if (transport) await transport.handlePostMessage(req, res);
 });
 
-// Initialize all repos then start server
-async function start() {
-  console.log("\n=== Initializing Repositories ===");
-  for (const [name, p] of Object.entries(REPO_MAP)) {
-    if (p) await syncRepo(name, p);
+async function main() {
+  console.log("=== Initializing Storage ===");
+  for (const [name, url] of Object.entries(REPO_URLS)) {
+    if (url) await ensureRepo(name, url);
   }
 
   app.listen(PORT, () => {
-    console.log(`\n=== Altius Multi-Repo MCP Running ===`);
-    console.log(`> Listening on: http://localhost:${PORT}/sse`);
-    console.log(`> Managed Repos: ${Object.keys(REPO_MAP).join(", ")}`);
+    console.log(`\n=== Altius MCP Running ===`);
+    console.log(`> Local Storage: ${CACHE_DIR}`);
+    console.log(`> URL: http://localhost:${PORT}/sse`);
   });
 }
 
-start();
+main();
