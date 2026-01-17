@@ -1,0 +1,6 @@
+# typescript output & dep
+dist
+node_modules
+
+# env
+.env
