@@ -161,6 +161,14 @@ app.use(cors());
 
 let transport: SSEServerTransport;
 
+app.get("/", (req, res) => {
+  res.send("Altius MCP Server is Running! 🚀");
+});
+
+app.get("/health", (req, res) => {
+  res.status(200).json({ status: "✅ healthy", timestamp: new Date().toISOString() });
+});
+
 app.get("/sse", async (req, res) => {
   console.log("-> Client connected");
   transport = new SSEServerTransport("/messages", res);
