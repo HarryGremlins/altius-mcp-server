@@ -203,13 +203,24 @@ app.get("/sse", async (req, res) => {
   console.log("-> New SSE Connection initiating...");
   
   const transport = new SSEServerTransport("/messages", res);
-  
   console.log(`-> Session created: ${transport.sessionId}`);
   transports.set(transport.sessionId, transport);
 
-  // FIX: Use the 'res' object to detect closure, as SSEServerTransport has no .on() method
+  // Send an SSE comment every 30 seconds to prevent load balancers/Nginx from closing the connection
+  const keepAliveInterval = setInterval(() => {
+    // Check if the connection is still alive
+    if (res.writableEnded || res.closed) {
+      clearInterval(keepAliveInterval);
+      return;
+    }
+    // Send an SSE comment line (starting with a colon), which the client will ignore but keeps the connection active
+    res.write(": keepalive\n\n");
+  }, 30000);
+
+  // Clean up timer and Session when the connection closes
   res.on("close", () => {
     console.log(`-> Session closed: ${transport.sessionId}`);
+    clearInterval(keepAliveInterval);
     transports.delete(transport.sessionId);
   });
 
