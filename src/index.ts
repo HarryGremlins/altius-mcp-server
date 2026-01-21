@@ -3,17 +3,13 @@ import cors from "cors";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { z } from "zod";
-import { exec } from "child_process";
-import util from "util";
+import { spawn } from "child_process";
 import fs from "fs/promises";
 import path from "path";
 import dotenv from "dotenv";
-import os from "os";
 
 // Load environment variables
 dotenv.config();
-
-const execAsync = util.promisify(exec);
 
 // =============================================================================
 // CONFIGURATION
@@ -31,30 +27,53 @@ const CACHE_DIR = path.join(process.cwd(), "repos");
 const LOCAL_PATHS: Record<string, string> = {};
 
 // =============================================================================
-// REPO MANAGEMENT
+// HELPER: SAFE GIT EXECUTION
 // =============================================================================
+
+/**
+ * Safely execute git commands using spawn to prevent shell injection
+ */
+async function gitSpawn(args: string[], cwd: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const process = spawn("git", args, { cwd });
+    
+    let stdout = "";
+    let stderr = "";
+
+    process.stdout.on("data", (data) => { stdout += data; });
+    process.stderr.on("data", (data) => { stderr += data; });
+
+    process.on("close", (code) => {
+      if (code === 0) {
+        resolve(stdout.trim());
+      } else {
+        // Handle git grep returning 1 when no matches are found
+        if (args.includes("grep") && code === 1) {
+            resolve(""); 
+        } else {
+            reject(new Error(`Git command failed: ${stderr || "Unknown error"}`));
+        }
+      }
+    });
+
+    process.on("error", (err) => reject(err));
+  });
+}
 
 async function ensureRepo(name: string, remoteUrl: string) {
   const localPath = path.join(CACHE_DIR, name);
   LOCAL_PATHS[name] = localPath;
 
-  console.log(`[Repo: ${name}] Preparing...`);
+  console.log(`[Repo: ${name}] Checking status...`);
 
   try {
-    try {
-      await fs.access(path.join(localPath, ".git"));
-      console.log(`[Repo: ${name}] Local cache found at ${localPath}`);
-      // Optional: Pull latest changes
-      // console.log(`[Repo: ${name}] Pulling latest changes...`);
-      // await execAsync("git pull", { cwd: localPath });
-    } catch (e) {
-      console.log(`[Repo: ${name}] Cache missing. Cloning from remote...`);
-      await fs.mkdir(CACHE_DIR, { recursive: true });
-      await execAsync(`git clone ${remoteUrl} ${name}`, { cwd: CACHE_DIR });
-      console.log(`[Repo: ${name}] Clone success!`);
-    }
-  } catch (error) {
-    console.error(`[Repo: ${name}] Critical Error during setup:`, error);
+    await fs.access(path.join(localPath, ".git"));
+    console.log(`[Repo: ${name}] Ready.`);
+  } catch (e) {
+    console.log(`[Repo: ${name}] Cloning...`);
+    await fs.mkdir(CACHE_DIR, { recursive: true });
+    await gitSpawn(["clone", remoteUrl, name], CACHE_DIR); 
+    console.log(`[Repo: ${name}] Cloned.`);
   }
 }
 
@@ -73,18 +92,17 @@ function getPath(repoName: string) {
   return p;
 }
 
-// Change 1: utilize server.tool instead of server.registerTool
 // Tool: List Repos
 server.tool(
   "list_repos", 
-  {}, // No input arguments
+  {}, 
   async () => {
     const list = Object.keys(LOCAL_PATHS).map(k => `- ${k}`).join("\n");
     return { content: [{ type: "text", text: `Active Repositories:\n${list}` }] };
   }
 );
 
-// Tool: Search Code
+// Tool: Search Code (Fixed injection vulnerability)
 server.tool(
   "search_code",
   {
@@ -93,25 +111,32 @@ server.tool(
     branch: z.string().optional(),
     path_filter: z.string().optional()
   },
-  // The 'args' object is now correctly typed thanks to Zod inference
   async ({ repo, query, branch, path_filter }) => {
     const cwd = getPath(repo);
     const ref = branch || "HEAD";
     const filter = path_filter || ".";
     
-    // Safety check for command injection is recommended here in production
-    // Using simple git grep
-    const cmd = `git grep -nI "${query}" ${ref} -- ${filter} | head -n 50`;
+    // Use spawn args array to prevent shell injection
+    // Equivalent to: git grep -nI "query" ref -- filter
+    const args = ["grep", "-nI", query, ref, "--", filter];
+    
     try {
-      const { stdout } = await execAsync(cmd, { cwd });
-      return { content: [{ type: "text", text: stdout || "No matches." }] };
-    } catch (e) {
-      return { content: [{ type: "text", text: "No matches found." }] };
+      // Fetch output safely
+      let output = await gitSpawn(args, cwd);
+      
+      const lines = output.split('\n');
+      if (lines.length > 50) {
+        output = lines.slice(0, 50).join('\n') + `\n... (${lines.length - 50} more matches)`;
+      }
+      
+      return { content: [{ type: "text", text: output || "No matches." }] };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `Error: ${e.message}` }] };
     }
   }
 );
 
-// Tool: Read File
+// Tool: Read File (Fixed path traversal)
 server.tool(
   "read_file",
   {
@@ -123,17 +148,17 @@ server.tool(
     const cwd = getPath(repo);
     const ref = branch || "HEAD";
     
-    // Basic path traversal prevention
-    if (filePath.includes("..")) {
-      return { content: [{ type: "text", text: "Invalid path" }], isError: true };
+    // Path traversal check
+    if (filePath.includes("..") || filePath.startsWith("/")) {
+      return { content: [{ type: "text", text: "Invalid path security check failed." }], isError: true };
     }
 
-    const cmd = `git show ${ref}:${filePath}`;
     try {
-      const { stdout } = await execAsync(cmd, { cwd });
-      return { content: [{ type: "text", text: stdout }] };
+      // git show ref:path
+      const output = await gitSpawn(["show", `${ref}:${filePath}`], cwd);
+      return { content: [{ type: "text", text: output }] };
     } catch (e) {
-      return { content: [{ type: "text", text: "File not found." }] };
+      return { content: [{ type: "text", text: "File not found or error reading." }] };
     }
   }
 );
@@ -144,8 +169,8 @@ server.tool(
   { repo: z.enum(["revm", "alloy", "reth"]) },
   async ({ repo }) => {
     try {
-      const { stdout } = await execAsync("git branch -a", { cwd: getPath(repo) });
-      return { content: [{ type: "text", text: stdout }] };
+      const output = await gitSpawn(["branch", "-a"], getPath(repo));
+      return { content: [{ type: "text", text: output }] };
     } catch (e) { 
       return { content: [{ type: "text", text: "Error listing branches" }] }; 
     }
@@ -153,30 +178,63 @@ server.tool(
 );
 
 // =============================================================================
-// HTTP SERVER
+// HTTP SERVER (Multi-Tenant Fix)
 // =============================================================================
 
 const app = express();
 app.use(cors());
 
-let transport: SSEServerTransport;
+// Map to store Session ID -> Transport
+const transports = new Map<string, SSEServerTransport>();
 
 app.get("/", (req, res) => {
   res.send("Altius MCP Server is Running! 🚀");
 });
 
 app.get("/health", (req, res) => {
-  res.status(200).json({ status: "✅ healthy", timestamp: new Date().toISOString() });
+  res.status(200).json({ status: "✅ healthy" });
 });
 
+/**
+ * SSE Endpoint
+ * Initializes a new transport for every connection and stores it.
+ */
 app.get("/sse", async (req, res) => {
-  console.log("-> Client connected");
-  transport = new SSEServerTransport("/messages", res);
+  console.log("-> New SSE Connection initiating...");
+  
+  const transport = new SSEServerTransport("/messages", res);
+  
+  console.log(`-> Session created: ${transport.sessionId}`);
+  transports.set(transport.sessionId, transport);
+
+  // FIX: Use the 'res' object to detect closure, as SSEServerTransport has no .on() method
+  res.on("close", () => {
+    console.log(`-> Session closed: ${transport.sessionId}`);
+    transports.delete(transport.sessionId);
+  });
+
   await server.connect(transport);
 });
 
+/**
+ * Messages Endpoint (Client -> Server)
+ * Routes messages to the correct transport based on sessionId.
+ */
 app.post("/messages", async (req, res) => {
-  if (transport) await transport.handlePostMessage(req, res);
+  const sessionId = req.query.sessionId as string;
+  
+  if (!sessionId) {
+    res.status(400).send("Missing sessionId");
+    return;
+  }
+
+  const transport = transports.get(sessionId);
+  if (!transport) {
+    res.status(404).send("Session not found or expired");
+    return;
+  }
+
+  await transport.handlePostMessage(req, res);
 });
 
 async function main() {
