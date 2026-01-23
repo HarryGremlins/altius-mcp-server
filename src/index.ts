@@ -36,7 +36,7 @@ const LOCAL_PATHS: Record<string, string> = {};
 async function gitSpawn(args: string[], cwd: string): Promise<string> {
   return new Promise((resolve, reject) => {
     const process = spawn("git", args, { cwd });
-    
+
     let stdout = "";
     let stderr = "";
 
@@ -49,9 +49,9 @@ async function gitSpawn(args: string[], cwd: string): Promise<string> {
       } else {
         // Handle git grep returning 1 when no matches are found
         if (args.includes("grep") && code === 1) {
-            resolve(""); 
+          resolve("");
         } else {
-            reject(new Error(`Git command failed: ${stderr || "Unknown error"}`));
+          reject(new Error(`Git command failed: ${stderr || "Unknown error"}`));
         }
       }
     });
@@ -72,7 +72,7 @@ async function ensureRepo(name: string, remoteUrl: string) {
   } catch (e) {
     console.log(`[Repo: ${name}] Cloning...`);
     await fs.mkdir(CACHE_DIR, { recursive: true });
-    await gitSpawn(["clone", remoteUrl, name], CACHE_DIR); 
+    await gitSpawn(["clone", remoteUrl, name], CACHE_DIR);
     console.log(`[Repo: ${name}] Cloned.`);
   }
 }
@@ -93,9 +93,12 @@ function getPath(repoName: string) {
 }
 
 // Tool: List Repos
-server.tool(
-  "list_repos", 
-  {}, 
+server.registerTool(
+  "list_repos",
+  {
+    description: "List all configured repositories related to Altius available for access.",
+    inputSchema: {}
+  },
   async () => {
     const list = Object.keys(LOCAL_PATHS).map(k => `- ${k}`).join("\n");
     return { content: [{ type: "text", text: `Active Repositories:\n${list}` }] };
@@ -103,32 +106,35 @@ server.tool(
 );
 
 // Tool: Search Code (Fixed injection vulnerability)
-server.tool(
+server.registerTool(
   "search_code",
   {
-    repo: z.enum(["revm", "alloy", "reth"]),
-    query: z.string(),
-    branch: z.string().optional(),
-    path_filter: z.string().optional()
+    description: "Search for code patterns using git grep in a specific Altius-related repo.",
+    inputSchema: {
+      repo: z.enum(["revm", "alloy", "reth"]),
+      query: z.string(),
+      branch: z.string().optional(),
+      path_filter: z.string().optional()
+    }
   },
   async ({ repo, query, branch, path_filter }) => {
     const cwd = getPath(repo);
     const ref = branch || "HEAD";
     const filter = path_filter || ".";
-    
+
     // Use spawn args array to prevent shell injection
     // Equivalent to: git grep -nI "query" ref -- filter
     const args = ["grep", "-nI", query, ref, "--", filter];
-    
+
     try {
       // Fetch output safely
       let output = await gitSpawn(args, cwd);
-      
+
       const lines = output.split('\n');
       if (lines.length > 50) {
         output = lines.slice(0, 50).join('\n') + `\n... (${lines.length - 50} more matches)`;
       }
-      
+
       return { content: [{ type: "text", text: output || "No matches." }] };
     } catch (e: any) {
       return { content: [{ type: "text", text: `Error: ${e.message}` }] };
@@ -137,17 +143,20 @@ server.tool(
 );
 
 // Tool: Read File (Fixed path traversal)
-server.tool(
+server.registerTool(
   "read_file",
   {
-    repo: z.enum(["revm", "alloy", "reth"]),
-    path: z.string(),
-    branch: z.string().optional()
+    description: "Read a file from a specific Altius-related repo and branch.",
+    inputSchema: {
+      repo: z.enum(["revm", "alloy", "reth"]),
+      path: z.string(),
+      branch: z.string().optional()
+    }
   },
   async ({ repo, path: filePath, branch }) => {
     const cwd = getPath(repo);
     const ref = branch || "HEAD";
-    
+
     // Path traversal check
     if (filePath.includes("..") || filePath.startsWith("/")) {
       return { content: [{ type: "text", text: "Invalid path security check failed." }], isError: true };
@@ -164,15 +173,18 @@ server.tool(
 );
 
 // Tool: List Branches
-server.tool(
+server.registerTool(
   "list_branches",
-  { repo: z.enum(["revm", "alloy", "reth"]) },
+  {
+    description: "List branches for a specific Altius-related repository.",
+    inputSchema: { repo: z.enum(["revm", "alloy", "reth"]) }
+  },
   async ({ repo }) => {
     try {
       const output = await gitSpawn(["branch", "-a"], getPath(repo));
       return { content: [{ type: "text", text: output }] };
-    } catch (e) { 
-      return { content: [{ type: "text", text: "Error listing branches" }] }; 
+    } catch (e) {
+      return { content: [{ type: "text", text: "Error listing branches" }] };
     }
   }
 );
@@ -201,7 +213,7 @@ app.get("/health", (req, res) => {
  */
 app.get("/sse", async (req, res) => {
   console.log("-> New SSE Connection initiating...");
-  
+
   const transport = new SSEServerTransport("/messages", res);
   console.log(`-> Session created: ${transport.sessionId}`);
   transports.set(transport.sessionId, transport);
@@ -233,7 +245,7 @@ app.get("/sse", async (req, res) => {
  */
 app.post("/messages", async (req, res) => {
   const sessionId = req.query.sessionId as string;
-  
+
   if (!sessionId) {
     res.status(400).send("Missing sessionId");
     return;
