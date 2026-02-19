@@ -1,0 +1,23 @@
+README.md
+  c7bcef065d75fd57 1-3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.4",
+  "base_commit_sha": "0842aec9ce59c1c47fccec3a5d148a3f0f0e44d3",
+  "prompts": {
+    "c7bcef065d75fd57": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "65c8e1fa-ba82-44a7-aec2-b5d0dcab3e84",
+        "model": "<synthetic>"
+      },
+      "human_author": "HarryGremlins <importwyf@altiuslabs.xyz>",
+      "messages": [],
+      "total_additions": 3,
+      "total_deletions": 0,
+      "accepted_lines": 3,
+      "overriden_lines": 0
+    }
+  }
+}
